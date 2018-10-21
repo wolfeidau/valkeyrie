@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/abronan/valkeyrie"
@@ -29,6 +30,8 @@ const (
 	partitionKey          = "id"
 	revisionAttribute     = "version"
 	encodedValueAttribute = "encoded_value"
+	ttlAttribute          = "expiration_time"
+	lockAttribute         = "lock"
 )
 
 var (
@@ -88,21 +91,34 @@ func (ddb *DynamoDB) Put(key string, value []byte, options *store.WriteOptions) 
 
 	exAttr[":incr"] = &dynamodb.AttributeValue{N: aws.String("1")}
 
-	req := &dynamodb.UpdateItemInput{
-		TableName:                 aws.String(ddb.tableName),
-		Key:                       keyAttr,
-		ExpressionAttributeValues: exAttr,
-	}
+	setList := []string{}
 
+	// if a value was provided append it to the update expression
 	if len(value) > 0 {
 		encodedValue := base64.StdEncoding.EncodeToString(value)
 		exAttr[":encv"] = &dynamodb.AttributeValue{S: aws.String(encodedValue)}
-		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr SET %s = :encv", revisionAttribute, encodedValueAttribute))
-	} else {
-		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr", revisionAttribute))
+		setList = append(setList, fmt.Sprintf("%s = :encv", encodedValueAttribute))
 	}
 
-	_, err := ddb.dynamoSvc.UpdateItem(req)
+	// if a ttl was provided validate it and append it to the update expression
+	if options != nil && options.TTL > 0 {
+		ttlVal := time.Now().Add(options.TTL).Unix()
+		exAttr[":ttl"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(ttlVal, 10))}
+		setList = append(setList, fmt.Sprintf("%s = :ttl", ttlAttribute))
+	}
+
+	updateExp := fmt.Sprintf("ADD %s :incr", revisionAttribute)
+
+	if len(setList) > 0 {
+		updateExp = fmt.Sprintf("%s SET %s", updateExp, strings.Join(setList, ","))
+	}
+
+	_, err := ddb.dynamoSvc.UpdateItem(&dynamodb.UpdateItemInput{
+		TableName:                 aws.String(ddb.tableName),
+		Key:                       keyAttr,
+		ExpressionAttributeValues: exAttr,
+		UpdateExpression:          aws.String(updateExp),
+	})
 	if err != nil {
 		return err
 	}
@@ -122,6 +138,11 @@ func (ddb *DynamoDB) Get(key string, options *store.ReadOptions) (*store.KVPair,
 		return nil, err
 	}
 	if res.Item == nil {
+		return nil, store.ErrKeyNotFound
+	}
+
+	// is the item expired?
+	if isItemExpired(res.Item) {
 		return nil, store.ErrKeyNotFound
 	}
 
@@ -177,6 +198,11 @@ func (ddb *DynamoDB) Exists(key string, options *store.ReadOptions) (bool, error
 		return false, nil
 	}
 
+	// is the item expired?
+	if isItemExpired(res.Item) {
+		return false, nil
+	}
+
 	return true, nil
 }
 
@@ -193,9 +219,11 @@ func (ddb *DynamoDB) List(directory string, options *store.ReadOptions) ([]*stor
 
 	expAttr[":namePrefix"] = &dynamodb.AttributeValue{S: aws.String(directory)}
 
+	filterExp := fmt.Sprintf("begins_with(%s, :namePrefix)", partitionKey)
+
 	res, err := ddb.dynamoSvc.Scan(&dynamodb.ScanInput{
 		TableName:                 aws.String(ddb.tableName),
-		FilterExpression:          aws.String(fmt.Sprintf("begins_with(%s, :namePrefix)", partitionKey)),
+		FilterExpression:          aws.String(filterExp),
 		ExpressionAttributeValues: expAttr,
 		ConsistentRead:            aws.Bool(options.Consistent),
 	})
@@ -215,10 +243,16 @@ func (ddb *DynamoDB) List(directory string, options *store.ReadOptions) ([]*stor
 		if err != nil {
 			return nil, err
 		}
+
 		// skip the records which match the prefix
 		if val.Key == directory {
 			continue
 		}
+		// skip records which are expired
+		if isItemExpired(item) {
+			continue
+		}
+
 		kvArray = append(kvArray, val)
 	}
 
@@ -272,8 +306,8 @@ func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair,
 	}
 
 	// AtomicPut is equivalent to Put if previous is nil and the Key
-	// doesn't exist in the DB.
-	if previous == nil && getRes.Item != nil {
+	// exist in the DB or is not expired.
+	if previous == nil && getRes.Item != nil && !isItemExpired(getRes.Item) {
 		return false, nil, store.ErrKeyExists
 	}
 
@@ -283,26 +317,47 @@ func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair,
 	exAttr := make(map[string]*dynamodb.AttributeValue)
 	exAttr[":incr"] = &dynamodb.AttributeValue{N: aws.String("1")}
 
-	req := &dynamodb.UpdateItemInput{
-		TableName:                 aws.String(ddb.tableName),
-		Key:                       keyAttr,
-		ExpressionAttributeValues: exAttr,
-	}
+	setList := []string{}
 
+	// if a value was provided append it to the update expression
 	if len(value) > 0 {
 		encodedValue := base64.StdEncoding.EncodeToString(value)
 		exAttr[":encv"] = &dynamodb.AttributeValue{S: aws.String(encodedValue)}
-		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr SET %s = :encv", revisionAttribute, encodedValueAttribute))
-	} else {
-		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr", revisionAttribute))
+		setList = append(setList, fmt.Sprintf("%s = :encv", encodedValueAttribute))
 	}
+
+	// if a ttl was provided validate it and append it to the update expression
+	if options != nil && options.TTL > 0 {
+		ttlVal := time.Now().Add(options.TTL).Unix()
+		exAttr[":ttl"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(ttlVal, 10))}
+		setList = append(setList, fmt.Sprintf("%s = :ttl", ttlAttribute))
+	}
+
+	updateExp := fmt.Sprintf("ADD %s :incr", revisionAttribute)
+
+	if len(setList) > 0 {
+		updateExp = fmt.Sprintf("%s SET %s", updateExp, strings.Join(setList, ","))
+	}
+
+	var condExp *string
 
 	if previous != nil {
+
 		exAttr[":lastRevision"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(previous.LastIndex, 10))}
-		req.ConditionExpression = aws.String(fmt.Sprintf("%s = :lastRevision", revisionAttribute))
+		exAttr[":timeNow"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatInt(time.Now().Unix(), 10))}
+
+		// the previous kv is in the DB and is at the expected revision, also if it has a TTL set it is NOT expired.
+		condExp = aws.String(fmt.Sprintf("%s = :lastRevision AND (attribute_not_exists(%s) OR (attribute_exists(%s) AND %s > :timeNow))",
+			revisionAttribute, ttlAttribute, ttlAttribute, ttlAttribute))
 	}
 
-	_, err = ddb.dynamoSvc.UpdateItem(req)
+	_, err = ddb.dynamoSvc.UpdateItem(&dynamodb.UpdateItemInput{
+		TableName:                 aws.String(ddb.tableName),
+		Key:                       keyAttr,
+		ExpressionAttributeValues: exAttr,
+		UpdateExpression:          aws.String(updateExp),
+		ConditionExpression:       condExp,
+	})
 
 	if err != nil {
 		if awsErr, ok := err.(awserr.Error); ok {
@@ -464,6 +519,17 @@ func (ddb *DynamoDB) retryDeleteTree(items map[string][]*dynamodb.WriteRequest) 
 		}
 	}
 
+}
+
+func isItemExpired(item map[string]*dynamodb.AttributeValue) bool {
+	var ttl int64
+
+	if v, ok := item[ttlAttribute]; ok {
+		ttl, _ = strconv.ParseInt(aws.StringValue(v.N), 10, 64)
+		return time.Unix(ttl, 0).Before(time.Now())
+	}
+
+	return false
 }
 
 func decodeItem(item map[string]*dynamodb.AttributeValue) (*store.KVPair, error) {

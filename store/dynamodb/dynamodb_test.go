@@ -44,8 +44,10 @@ func TestSetup(t *testing.T) {
 
 func TestDynamoDBStore(t *testing.T) {
 	ddbStore := newDynamoDBStore(t)
+	backupStore := newDynamoDBStore(t)
 	testutils.RunTestCommon(t, ddbStore)
 	testutils.RunTestAtomic(t, ddbStore)
+	testutils.RunTestTTL(t, ddbStore, backupStore)
 }
 
 func TestDynamoDBStoreUnsupported(t *testing.T) {
@@ -134,6 +136,10 @@ func TestDecodeItem(t *testing.T) {
 	kv, err = decodeItem(data)
 	assert.Error(t, err)
 	assert.Nil(t, kv)
+}
+
+func TestPutWithTTL(t *testing.T) {
+
 }
 
 func (m *mockedBatchWrite) BatchWriteItem(in *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {
