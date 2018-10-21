@@ -3,11 +3,10 @@ package dynamodb
 import (
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-
 	"github.com/abronan/valkeyrie"
 	"github.com/abronan/valkeyrie/store"
 	"github.com/abronan/valkeyrie/testutils"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -112,6 +111,29 @@ type mockedBatchWrite struct {
 	dynamodbiface.DynamoDBAPI
 	BatchWriteResp *dynamodb.BatchWriteItemOutput
 	Count          int
+}
+
+func TestDecodeItem(t *testing.T) {
+	data := map[string]*dynamodb.AttributeValue{
+		partitionKey: &dynamodb.AttributeValue{
+			S: aws.String("abc123"),
+		},
+		revisionAttribute: &dynamodb.AttributeValue{
+			N: aws.String("10"),
+		},
+		encodedValueAttribute: &dynamodb.AttributeValue{
+			S: aws.String("YWJjMTIzCg=="),
+		},
+	}
+
+	kv, err := decodeItem(data)
+	assert.NoError(t, err)
+	assert.Equal(t, &store.KVPair{Key: "abc123", Value: []uint8{0x61, 0x62, 0x63, 0x31, 0x32, 0x33, 0xa}, LastIndex: 0xa}, kv)
+
+	data[encodedValueAttribute] = &dynamodb.AttributeValue{S: aws.String("not base64")}
+	kv, err = decodeItem(data)
+	assert.Error(t, err)
+	assert.Nil(t, kv)
 }
 
 func (m *mockedBatchWrite) BatchWriteItem(in *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {

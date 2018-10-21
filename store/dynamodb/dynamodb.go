@@ -3,6 +3,7 @@ package dynamodb
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -12,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 )
 
@@ -25,6 +25,10 @@ const (
 	TableCreateTimeoutSeconds = 30
 	// DeleteTreeTimeoutSeconds the maximum time we retry a write batch
 	DeleteTreeTimeoutSeconds = 30
+
+	partitionKey          = "id"
+	revisionAttribute     = "version"
+	encodedValueAttribute = "encoded_value"
 )
 
 var (
@@ -78,7 +82,7 @@ type DynamoDB struct {
 func (ddb *DynamoDB) Put(key string, value []byte, options *store.WriteOptions) error {
 
 	keyAttr := make(map[string]*dynamodb.AttributeValue)
-	keyAttr["id"] = &dynamodb.AttributeValue{S: aws.String(key)}
+	keyAttr[partitionKey] = &dynamodb.AttributeValue{S: aws.String(key)}
 
 	exAttr := make(map[string]*dynamodb.AttributeValue)
 
@@ -93,9 +97,9 @@ func (ddb *DynamoDB) Put(key string, value []byte, options *store.WriteOptions) 
 	if len(value) > 0 {
 		encodedValue := base64.StdEncoding.EncodeToString(value)
 		exAttr[":encv"] = &dynamodb.AttributeValue{S: aws.String(encodedValue)}
-		req.UpdateExpression = aws.String("ADD version :incr SET encoded_value = :encv")
+		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr SET %s = :encv", revisionAttribute, encodedValueAttribute))
 	} else {
-		req.UpdateExpression = aws.String("ADD version :incr")
+		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr", revisionAttribute))
 	}
 
 	_, err := ddb.dynamoSvc.UpdateItem(req)
@@ -108,7 +112,12 @@ func (ddb *DynamoDB) Put(key string, value []byte, options *store.WriteOptions) 
 
 // Get a value given its key
 func (ddb *DynamoDB) Get(key string, options *store.ReadOptions) (*store.KVPair, error) {
-	res, err := ddb.getKey(key)
+	if options == nil {
+		options = &store.ReadOptions{
+			Consistent: true, // default to enabling read consistency
+		}
+	}
+	res, err := ddb.getKey(key, options)
 	if err != nil {
 		return nil, err
 	}
@@ -119,12 +128,12 @@ func (ddb *DynamoDB) Get(key string, options *store.ReadOptions) (*store.KVPair,
 	return decodeItem(res.Item)
 }
 
-func (ddb *DynamoDB) getKey(key string) (*dynamodb.GetItemOutput, error) {
+func (ddb *DynamoDB) getKey(key string, options *store.ReadOptions) (*dynamodb.GetItemOutput, error) {
 	return ddb.dynamoSvc.GetItem(&dynamodb.GetItemInput{
 		TableName:      aws.String(ddb.tableName),
-		ConsistentRead: aws.Bool(true),
+		ConsistentRead: aws.Bool(options.Consistent),
 		Key: map[string]*dynamodb.AttributeValue{
-			"id": {
+			partitionKey: {
 				S: aws.String(key),
 			},
 		},
@@ -136,7 +145,7 @@ func (ddb *DynamoDB) Delete(key string) error {
 	_, err := ddb.dynamoSvc.DeleteItem(&dynamodb.DeleteItemInput{
 		TableName: aws.String(ddb.tableName),
 		Key: map[string]*dynamodb.AttributeValue{
-			"id": {
+			partitionKey: {
 				S: aws.String(key),
 			},
 		},
@@ -154,7 +163,7 @@ func (ddb *DynamoDB) Exists(key string, options *store.ReadOptions) (bool, error
 	res, err := ddb.dynamoSvc.GetItem(&dynamodb.GetItemInput{
 		TableName: aws.String(ddb.tableName),
 		Key: map[string]*dynamodb.AttributeValue{
-			"id": {
+			partitionKey: {
 				S: aws.String(key),
 			},
 		},
@@ -174,14 +183,21 @@ func (ddb *DynamoDB) Exists(key string, options *store.ReadOptions) (bool, error
 // List the content of a given prefix
 func (ddb *DynamoDB) List(directory string, options *store.ReadOptions) ([]*store.KVPair, error) {
 
+	if options == nil {
+		options = &store.ReadOptions{
+			Consistent: true, // default to enabling read consistency
+		}
+	}
+
 	expAttr := make(map[string]*dynamodb.AttributeValue)
 
 	expAttr[":namePrefix"] = &dynamodb.AttributeValue{S: aws.String(directory)}
 
 	res, err := ddb.dynamoSvc.Scan(&dynamodb.ScanInput{
 		TableName:                 aws.String(ddb.tableName),
-		FilterExpression:          aws.String("begins_with(id, :namePrefix)"),
+		FilterExpression:          aws.String(fmt.Sprintf("begins_with(%s, :namePrefix)", partitionKey)),
 		ExpressionAttributeValues: expAttr,
+		ConsistentRead:            aws.Bool(options.Consistent),
 	})
 	if err != nil {
 		return nil, err
@@ -217,7 +233,7 @@ func (ddb *DynamoDB) DeleteTree(keyPrefix string) error {
 
 	res, err := ddb.dynamoSvc.Scan(&dynamodb.ScanInput{
 		TableName:                 aws.String(ddb.tableName),
-		FilterExpression:          aws.String("begins_with(id, :namePrefix)"),
+		FilterExpression:          aws.String(fmt.Sprintf("begins_with(%s, :namePrefix)", partitionKey)),
 		ExpressionAttributeValues: expAttr,
 	})
 	if err != nil {
@@ -236,7 +252,7 @@ func (ddb *DynamoDB) DeleteTree(keyPrefix string) error {
 		items[ddb.tableName][n] = &dynamodb.WriteRequest{
 			DeleteRequest: &dynamodb.DeleteRequest{
 				Key: map[string]*dynamodb.AttributeValue{
-					"id": item["id"],
+					partitionKey: item[partitionKey],
 				},
 			},
 		}
@@ -248,7 +264,9 @@ func (ddb *DynamoDB) DeleteTree(keyPrefix string) error {
 // AtomicPut Atomic CAS operation on a single value.
 func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair, options *store.WriteOptions) (bool, *store.KVPair, error) {
 
-	getRes, err := ddb.getKey(key)
+	getRes, err := ddb.getKey(key, &store.ReadOptions{
+		Consistent: true, // enable the read consitant flag
+	})
 	if err != nil {
 		return false, nil, err
 	}
@@ -260,7 +278,7 @@ func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair,
 	}
 
 	keyAttr := make(map[string]*dynamodb.AttributeValue)
-	keyAttr["id"] = &dynamodb.AttributeValue{S: aws.String(key)}
+	keyAttr[partitionKey] = &dynamodb.AttributeValue{S: aws.String(key)}
 
 	exAttr := make(map[string]*dynamodb.AttributeValue)
 	exAttr[":incr"] = &dynamodb.AttributeValue{N: aws.String("1")}
@@ -274,14 +292,14 @@ func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair,
 	if len(value) > 0 {
 		encodedValue := base64.StdEncoding.EncodeToString(value)
 		exAttr[":encv"] = &dynamodb.AttributeValue{S: aws.String(encodedValue)}
-		req.UpdateExpression = aws.String("ADD version :incr SET encoded_value = :encv")
+		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr SET %s = :encv", revisionAttribute, encodedValueAttribute))
 	} else {
-		req.UpdateExpression = aws.String("ADD version :incr")
+		req.UpdateExpression = aws.String(fmt.Sprintf("ADD %s :incr", revisionAttribute))
 	}
 
 	if previous != nil {
-		exAttr[":lastVersion"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(previous.LastIndex, 10))}
-		req.ConditionExpression = aws.String("version = :lastVersion")
+		exAttr[":lastRevision"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(previous.LastIndex, 10))}
+		req.ConditionExpression = aws.String(fmt.Sprintf("%s = :lastRevision", revisionAttribute))
 	}
 
 	_, err = ddb.dynamoSvc.UpdateItem(req)
@@ -301,7 +319,9 @@ func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair,
 // AtomicDelete delete of a single value
 func (ddb *DynamoDB) AtomicDelete(key string, previous *store.KVPair) (bool, error) {
 
-	getRes, err := ddb.getKey(key)
+	getRes, err := ddb.getKey(key, &store.ReadOptions{
+		Consistent: true, // enable the read consitant flag
+	})
 	if err != nil {
 		return false, err
 	}
@@ -311,16 +331,16 @@ func (ddb *DynamoDB) AtomicDelete(key string, previous *store.KVPair) (bool, err
 	}
 
 	expAttr := make(map[string]*dynamodb.AttributeValue)
-	expAttr[":lastVersion"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(previous.LastIndex, 10))}
+	expAttr[":lastRevision"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(previous.LastIndex, 10))}
 
 	_, err = ddb.dynamoSvc.DeleteItem(&dynamodb.DeleteItemInput{
 		TableName: aws.String(ddb.tableName),
 		Key: map[string]*dynamodb.AttributeValue{
-			"id": {
+			partitionKey: {
 				S: aws.String(key),
 			},
 		},
-		ConditionExpression:       aws.String("version = :lastVersion"),
+		ConditionExpression:       aws.String(fmt.Sprintf("%s = :lastRevision", revisionAttribute)),
 		ExpressionAttributeValues: expAttr,
 	})
 
@@ -359,13 +379,13 @@ func (ddb *DynamoDB) createTable() error {
 	_, err := ddb.dynamoSvc.CreateTable(&dynamodb.CreateTableInput{
 		AttributeDefinitions: []*dynamodb.AttributeDefinition{
 			{
-				AttributeName: aws.String("id"),
+				AttributeName: aws.String(partitionKey),
 				AttributeType: aws.String("S"),
 			},
 		},
 		KeySchema: []*dynamodb.KeySchemaElement{
 			{
-				AttributeName: aws.String("id"),
+				AttributeName: aws.String(partitionKey),
 				KeyType:       aws.String(dynamodb.KeyTypeHash),
 			},
 		},
@@ -447,27 +467,37 @@ func (ddb *DynamoDB) retryDeleteTree(items map[string][]*dynamodb.WriteRequest) 
 }
 
 func decodeItem(item map[string]*dynamodb.AttributeValue) (*store.KVPair, error) {
-	entry := new(ddbEntry)
 
-	err := dynamodbattribute.ConvertFromMap(item, entry)
-	if err != nil {
-		return nil, err
+	var (
+		key          string
+		revision     int64
+		encodedValue string
+		err          error
+	)
+
+	if v, ok := item[partitionKey]; ok {
+		key = aws.StringValue(v.S)
 	}
 
-	rawValue, err := base64.StdEncoding.DecodeString(entry.EncodedValue)
+	if v, ok := item[revisionAttribute]; ok {
+		revision, err = strconv.ParseInt(aws.StringValue(v.N), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if v, ok := item[encodedValueAttribute]; ok {
+		encodedValue = aws.StringValue(v.S)
+	}
+
+	rawValue, err := base64.StdEncoding.DecodeString(encodedValue)
 	if err != nil {
 		return nil, err
 	}
 
 	return &store.KVPair{
-		Key:       entry.Name,
+		Key:       key,
 		Value:     rawValue,
-		LastIndex: uint64(entry.Version),
+		LastIndex: uint64(revision),
 	}, nil
-}
-
-type ddbEntry struct {
-	Name         string `json:"id"`
-	EncodedValue string `json:"encoded_value"`
-	Version      int64  `json:"version"`
 }
