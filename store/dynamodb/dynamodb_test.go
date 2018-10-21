@@ -50,12 +50,17 @@ func TestDynamoDBStore(t *testing.T) {
 	testutils.RunTestTTL(t, ddbStore, backupStore)
 }
 
+func TestDynamoDBStoreLock(t *testing.T) {
+	ddbStore := newDynamoDBStore(t)
+	backupStore := newDynamoDBStore(t)
+	testutils.RunTestLock(t, ddbStore)
+	testutils.RunTestLockTTL(t, ddbStore, backupStore)
+}
+
 func TestDynamoDBStoreUnsupported(t *testing.T) {
 	ddbStore := newDynamoDBStore(t)
-	_, err := ddbStore.NewLock("test", nil)
-	assert.Equal(t, store.ErrCallNotSupported, err)
 
-	_, err = ddbStore.WatchTree("test", nil, nil)
+	_, err := ddbStore.WatchTree("test", nil, nil)
 	assert.Equal(t, store.ErrCallNotSupported, err)
 
 	_, err = ddbStore.Watch("test", nil, nil)

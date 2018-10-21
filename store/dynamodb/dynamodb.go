@@ -32,6 +32,9 @@ const (
 	encodedValueAttribute = "encoded_value"
 	ttlAttribute          = "expiration_time"
 	lockAttribute         = "lock"
+
+	noExpiration   = time.Duration(0)
+	defaultLockTTL = 60 * time.Second
 )
 
 var (
@@ -43,6 +46,8 @@ var (
 	ErrTableCreateTimeout = errors.New("dynamodb table creation timed out")
 	// ErrDeleteTreeTimeout delete batch timed out
 	ErrDeleteTreeTimeout = errors.New("delete batch timed out")
+	// ErrLockAcquireCancelled stop called before lock was acquired.
+	ErrLockAcquireCancelled = errors.New("stop called before lock was acquired")
 )
 
 // Register register a store provider in valkeyrie for AWS DynamoDB
@@ -351,12 +356,13 @@ func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair,
 			revisionAttribute, ttlAttribute, ttlAttribute, ttlAttribute))
 	}
 
-	_, err = ddb.dynamoSvc.UpdateItem(&dynamodb.UpdateItemInput{
+	res, err := ddb.dynamoSvc.UpdateItem(&dynamodb.UpdateItemInput{
 		TableName:                 aws.String(ddb.tableName),
 		Key:                       keyAttr,
 		ExpressionAttributeValues: exAttr,
 		UpdateExpression:          aws.String(updateExp),
 		ConditionExpression:       condExp,
+		ReturnValues:              aws.String(dynamodb.ReturnValueAllNew),
 	})
 
 	if err != nil {
@@ -368,7 +374,12 @@ func (ddb *DynamoDB) AtomicPut(key string, value []byte, previous *store.KVPair,
 		return false, nil, err
 	}
 
-	return true, nil, nil
+	item, err := decodeItem(res.Attributes)
+	if err != nil {
+		return false, nil, err
+	}
+
+	return true, item, nil
 }
 
 // AtomicDelete delete of a single value
@@ -381,14 +392,14 @@ func (ddb *DynamoDB) AtomicDelete(key string, previous *store.KVPair) (bool, err
 		return false, err
 	}
 
-	if previous == nil && getRes.Item != nil {
+	if previous == nil && getRes.Item != nil && !isItemExpired(getRes.Item) {
 		return false, store.ErrKeyExists
 	}
 
 	expAttr := make(map[string]*dynamodb.AttributeValue)
 	expAttr[":lastRevision"] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(previous.LastIndex, 10))}
 
-	_, err = ddb.dynamoSvc.DeleteItem(&dynamodb.DeleteItemInput{
+	req := &dynamodb.DeleteItemInput{
 		TableName: aws.String(ddb.tableName),
 		Key: map[string]*dynamodb.AttributeValue{
 			partitionKey: {
@@ -397,8 +408,8 @@ func (ddb *DynamoDB) AtomicDelete(key string, previous *store.KVPair) (bool, err
 		},
 		ConditionExpression:       aws.String(fmt.Sprintf("%s = :lastRevision", revisionAttribute)),
 		ExpressionAttributeValues: expAttr,
-	})
-
+	}
+	_, err = ddb.dynamoSvc.DeleteItem(req)
 	if err != nil {
 		if awsErr, ok := err.(awserr.Error); ok {
 			if awsErr.Code() == dynamodb.ErrCodeConditionalCheckFailedException {
@@ -414,9 +425,148 @@ func (ddb *DynamoDB) AtomicDelete(key string, previous *store.KVPair) (bool, err
 // Close nothing to see here
 func (ddb *DynamoDB) Close() {}
 
+type dynamodbLock struct {
+	ddb      *DynamoDB
+	last     *store.KVPair
+	renewCh  chan struct{}
+	unlockCh chan struct{}
+
+	key   string
+	value []byte
+	ttl   time.Duration
+}
+
+func (l *dynamodbLock) Lock(stopChan chan struct{}) (<-chan struct{}, error) {
+	lockHeld := make(chan struct{})
+
+	success, err := l.tryLock(lockHeld, stopChan)
+	if err != nil {
+		return nil, err
+	}
+	if success {
+		return lockHeld, nil
+	}
+
+	// this really needs a jitter for backoff
+	ticker := time.NewTicker(3 * time.Second)
+
+	for {
+		select {
+		case <-ticker.C:
+			success, err := l.tryLock(lockHeld, stopChan)
+			if err != nil {
+				return nil, err
+			}
+			if success {
+				return lockHeld, nil
+			}
+		case <-stopChan:
+			return nil, ErrLockAcquireCancelled
+		}
+	}
+
+}
+
+func (l *dynamodbLock) Unlock() error {
+	l.unlockCh <- struct{}{}
+
+	_, err := l.ddb.AtomicDelete(l.key, l.last)
+	if err != nil {
+		return err
+	}
+	l.last = nil
+
+	return err
+}
+
+func (l *dynamodbLock) tryLock(lockHeld chan struct{}, stopChan chan struct{}) (bool, error) {
+	success, new, err := l.ddb.AtomicPut(
+		l.key,
+		l.value,
+		l.last,
+		&store.WriteOptions{
+			TTL: l.ttl,
+		})
+	if err != nil {
+		if err == store.ErrKeyNotFound || err == store.ErrKeyModified || err == store.ErrKeyExists {
+			return false, nil
+		}
+		return false, err
+	}
+	if success {
+		l.last = new
+		// keep holding
+		go l.holdLock(lockHeld, stopChan)
+		return true, nil
+	}
+
+	return false, err
+}
+
+func (l *dynamodbLock) holdLock(lockHeld, stopChan chan struct{}) {
+	defer close(lockHeld)
+
+	hold := func() error {
+		_, new, err := l.ddb.AtomicPut(
+			l.key,
+			l.value,
+			l.last,
+			&store.WriteOptions{
+				TTL: l.ttl,
+			})
+		if err == nil {
+			l.last = new
+		}
+		return err
+	}
+
+	// may need a floor of 1 second set
+	heartbeat := time.NewTicker(l.ttl / 3)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-heartbeat.C:
+			if err := hold(); err != nil {
+				return
+			}
+		case <-l.renewCh:
+			return
+		case <-l.unlockCh:
+			return
+		case <-stopChan:
+			return
+		}
+	}
+}
+
 // NewLock has to implemented at the library level since its not supported by DynamoDB
 func (ddb *DynamoDB) NewLock(key string, options *store.LockOptions) (store.Locker, error) {
-	return nil, store.ErrCallNotSupported
+	var (
+		value   []byte
+		ttl     = defaultLockTTL
+		renewCh = make(chan struct{})
+	)
+
+	if options != nil && options.TTL != 0 {
+		ttl = options.TTL
+	}
+	if options != nil && len(options.Value) != 0 {
+		value = options.Value
+	}
+	if options != nil && options.RenewLock != nil {
+		renewCh = options.RenewLock
+	}
+
+	return &dynamodbLock{
+		ddb:      ddb,
+		last:     nil,
+		key:      key,
+		value:    value,
+		ttl:      ttl,
+		renewCh:  renewCh,
+		unlockCh: make(chan struct{}),
+	}, nil
 }
 
 // Watch has to implemented at the library level since its not supported by DynamoDB
